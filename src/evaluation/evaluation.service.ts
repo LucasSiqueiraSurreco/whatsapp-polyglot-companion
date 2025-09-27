@@ -112,7 +112,7 @@ const LANGUAGE_MAP: Record<string, string> = {
   arabic: "árabe",
   "ar-sa": "árabe",
 
-  // Unknown ?
+  // Unknown
   latin: "desconhecido",
   la: "desconhecido",
   unknown: "desconhecido",
@@ -121,7 +121,6 @@ const LANGUAGE_MAP: Record<string, string> = {
 
 const VALID_LANGUAGES = [
   "inglês",
-  "português",
   "espanhol",
   "francês",
   "italiano",
@@ -159,16 +158,15 @@ const DEFAULT_RESPONSES = {
   unknownLanguage: (text: string) => ({
     transcription: text,
     score: 0,
-    feedback: `Consegui transcrever "${text}", mas não consegui identificar o idioma com certeza. Pode me dizer qual idioma você falou ou tentar falar um pouco mais claramente?`,
-    tips: "Tente falar um pouco mais devagar ou repita a frase para melhor detecção do idioma.",
+    feedback: `Consegui transcrever "${text}", mas não consegui identificar o idioma. Pode repetir mais claramente?`,
+    tips: "Fale um pouco mais devagar para melhor detecção.",
     language: "desconhecido",
   }),
   defaultEvaluation: {
     transcription: "Não foi possível processar o áudio.",
     score: 5,
-    feedback:
-      "Não foi possível analisar a pronúncia no momento. Tente novamente.",
-    tips: "Continue praticando a pronúncia regularmente!",
+    feedback: "Não foi possível analisar a pronúncia no momento.",
+    tips: "Continue praticando!",
     language: "desconhecido",
   },
 };
@@ -177,7 +175,7 @@ const DEFAULT_RESPONSES = {
 export class EvaluationService {
   private readonly logger = new Logger(EvaluationService.name);
   private readonly openai: OpenAI;
-  private readonly tempDir = "/tmp";
+  private readonly tempDir = "/tmp/claude";
 
   constructor(private readonly configService: ConfigService) {
     this.openai = new OpenAI({
@@ -201,7 +199,6 @@ export class EvaluationService {
       }
 
       const evaluation = await this.evaluateAudioPronunciation(
-        audioBuffer,
         transcriptionResult.text,
         transcriptionResult.language,
         transcriptionResult.audioMetrics
@@ -231,12 +228,19 @@ export class EvaluationService {
     try {
       const response = await this.callWhisperAPI(tempFile);
       const audioMetrics = this.extractAudioMetrics(response);
-      const detectedLanguage = await this.detectLanguageWithFallback(
-        response.language || "unknown",
-        response.text || ""
-      );
 
-      this.logger.log(`Final detected language: ${detectedLanguage}`);
+      const whisperLang = response.language || "unknown";
+      const normalizedLang = whisperLang.toLowerCase().trim();
+      let detectedLanguage = LANGUAGE_MAP[normalizedLang] || "desconhecido";
+
+      if (
+        detectedLanguage === "português" ||
+        detectedLanguage === "desconhecido"
+      ) {
+        detectedLanguage = await this.quickLanguageCheck(response.text || "");
+      }
+
+      this.logger.log(`Language detected: ${detectedLanguage}`);
 
       return {
         text: response.text || "Não foi possível transcrever o áudio.",
@@ -314,87 +318,67 @@ export class EvaluationService {
     }
   }
 
-  private async detectLanguageWithFallback(
-    whisperLanguage: string,
-    text: string
-  ): Promise<string> {
-    const normalizedLanguage = whisperLanguage.toLowerCase().trim();
-    let detectedLanguageName = LANGUAGE_MAP[normalizedLanguage];
-
-    // Sempre verificar com análise baseada em conteúdo
-    const contentBasedLanguage = await this.detectLanguageFromContent(text);
-
-    this.logger.log(
-      `Whisper: "${detectedLanguageName}", Content: "${contentBasedLanguage}"`
-    );
-
-    // Priorizar análise de conteúdo se divergir
-    if (
-      this.shouldUseContentAnalysis(contentBasedLanguage, detectedLanguageName)
-    ) {
-      this.logger.log(`Using content analysis: ${contentBasedLanguage}`);
-      return contentBasedLanguage;
-    }
-
-    return detectedLanguageName || "desconhecido";
-  }
-
-  private shouldUseContentAnalysis(
-    contentLanguage: string,
-    whisperLanguage: string | undefined
-  ): boolean {
-    return (
-      contentLanguage &&
-      contentLanguage !== "desconhecido" &&
-      (contentLanguage !== whisperLanguage ||
-        !whisperLanguage ||
-        whisperLanguage === "desconhecido")
-    );
-  }
-
-  private async detectLanguageFromContent(text: string): Promise<string> {
+  private async quickLanguageCheck(text: string): Promise<string> {
     if (!text || text.trim().length < 3) {
       return "desconhecido";
     }
 
     try {
-      const prompt = this.buildLanguageDetectionPrompt(text);
-      const completion = await this.callGPT(prompt, 20, 0.0);
-      const detected = completion.trim().toLowerCase();
+      const prompt = `Lang of "${text.substring(0, 50)}"?
+Reply ONLY: en/es/fr/it/de/ja/ko/zh/ru/ar/unknown`;
 
-      this.logger.log(`Content-based detection: "${detected}"`);
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 50,
+        temperature: 0.0,
+      });
 
-      return VALID_LANGUAGES.includes(detected) ? detected : "desconhecido";
+      const detected =
+        completion.choices[0]?.message?.content?.trim().toLowerCase() ||
+        "unknown";
+
+      const quickMap: Record<string, string> = {
+        en: "inglês",
+        es: "espanhol",
+        fr: "francês",
+        it: "italiano",
+        de: "alemão",
+        ja: "japonês",
+        ko: "coreano",
+        zh: "chinês",
+        ru: "russo",
+        ar: "árabe",
+        unknown: "desconhecido",
+      };
+
+      return quickMap[detected] || "desconhecido";
     } catch (error) {
-      this.logger.error("Error in content-based language detection:", error);
+      this.logger.error("Quick language check failed:", error);
       return "desconhecido";
     }
   }
 
   private async detectTextLanguage(text: string): Promise<string> {
     try {
-      const prompt = this.buildTextLanguagePrompt(text);
-      const completion = await this.callGPT(prompt, 20, 0.0);
-      const detectedLanguage = completion.trim().toLowerCase();
+      const prompt = `Lang: "${text.substring(0, 50)}"
+Reply: inglês/espanhol/francês/italiano/alemão/japonês/coreano/chinês/russo/árabe`;
 
-      // Verificar correspondência exata primeiro
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 10,
+        temperature: 0.0,
+      });
+
+      const detectedLanguage =
+        completion.choices[0]?.message?.content?.trim().toLowerCase() ||
+        "inglês";
+
       if (VALID_LANGUAGES.includes(detectedLanguage)) {
         return detectedLanguage;
       }
 
-      // Tentar correspondência parcial
-      const partialMatch = VALID_LANGUAGES.find(
-        (lang) =>
-          detectedLanguage.includes(lang) || lang.includes(detectedLanguage)
-      );
-
-      if (partialMatch) {
-        return partialMatch;
-      }
-
-      this.logger.warn(
-        `Unknown language: ${detectedLanguage}, defaulting to inglês`
-      );
       return "inglês";
     } catch (error) {
       this.logger.error("Error detecting text language:", error);
@@ -403,23 +387,29 @@ export class EvaluationService {
   }
 
   private async evaluateAudioPronunciation(
-    audioBuffer: Buffer,
     transcription: string,
     detectedLanguage: string,
     audioMetrics?: AudioMetrics
   ): Promise<LanguageEvaluation> {
     try {
-      this.logger.log("Analyzing pronunciation with GPT-4...");
+      this.logger.log("Evaluating pronunciation with optimized GPT-4...");
 
       const targetLanguage = LANGUAGE_TO_ENGLISH[detectedLanguage] || "English";
-      const audioContext = this.buildAudioContext(audioMetrics, transcription);
-      const prompt = this.buildEvaluationPrompt(
-        transcription,
-        targetLanguage,
-        audioContext
-      );
+      const qualityLevel = this.getQualityLevel(audioMetrics);
 
-      const response = await this.callGPT(prompt, 1000, 0.3);
+      const prompt = `Professor de ${targetLanguage} avaliando aluno brasileiro.
+Transcrição: "${transcription}"
+Qualidade áudio: ${qualityLevel}
+
+Avaliar:
+1) Gramática correta?
+2) Pronúncia clara?
+3) Nota 1-10 (seja rigoroso)
+
+JSON apenas:
+{"score":N,"feedback":"max 100 chars","tips":"max 50 chars"}`;
+
+      const response = await this.callGPT(prompt, 200, 0.3, "gpt-4o-mini");
       const evaluation = this.parseEvaluationResponse(response);
 
       return {
@@ -427,7 +417,7 @@ export class EvaluationService {
         language: detectedLanguage,
       };
     } catch (error) {
-      this.logger.error("Error with GPT-4 evaluation:", error);
+      this.logger.error("Error with GPT evaluation:", error);
       return this.evaluatePronunciation(transcription, detectedLanguage);
     }
   }
@@ -437,11 +427,11 @@ export class EvaluationService {
     detectedLanguage: string
   ): Promise<LanguageEvaluation> {
     try {
-      const prompt = this.buildTextEvaluationPrompt(
-        transcription,
-        detectedLanguage
-      );
-      const response = await this.callGPT(prompt, 1000, 0.7);
+      const prompt = `Avalie texto em ${detectedLanguage}:
+"${transcription}"
+JSON: {"score":1-10,"feedback":"erro se houver","tips":"dica breve"}`;
+
+      const response = await this.callGPT(prompt, 150, 0.5, "gpt-3.5-turbo");
       const evaluation = this.parseEvaluationResponse(response);
 
       return {
@@ -453,34 +443,16 @@ export class EvaluationService {
       return {
         score: 5,
         feedback: "Erro ao analisar.",
-        tips: "Tente novamente em alguns instantes.",
+        tips: "Tente novamente.",
         language: detectedLanguage,
       };
     }
   }
 
-  private buildAudioContext(
-    audioMetrics: AudioMetrics | undefined,
-    transcription: string
-  ): string {
-    if (!audioMetrics) return "";
+  private getQualityLevel(audioMetrics?: AudioMetrics): string {
+    if (!audioMetrics) return "regular";
 
     const confidence = -audioMetrics.avgLogprob;
-    const speechRate = transcription.split(" ").length / audioMetrics.duration;
-    const qualityLevel = this.getQualityLevel(confidence);
-
-    return `
-CONTEXTO INTERNO PARA AVALIAÇÃO (NÃO MENCIONE NÚMEROS TÉCNICOS):
-- A pronúncia parece estar no nível: ${qualityLevel}
-- Velocidade da fala: ${speechRate?.toFixed(1)} palavras/segundo
-- Duração: ${audioMetrics.duration?.toFixed(1)}s
-- Número de palavras: ${transcription.split(" ").length}
-
-IMPORTANTE: NÃO mencione "confiança", "métricas" ou números técnicos na resposta ao usuário.
-`;
-  }
-
-  private getQualityLevel(confidence: number): string {
     if (confidence > 0.7) return "excelente";
     if (confidence > 0.4) return "boa";
     if (confidence > 0.2) return "regular";
@@ -500,7 +472,7 @@ IMPORTANTE: NÃO mencione "confiança", "métricas" ou números técnicos na res
       return {
         score: 5,
         feedback: "Não foi possível analisar no momento.",
-        tips: "Continue praticando regularmente!",
+        tips: "Continue praticando!",
       };
     }
   }
@@ -508,129 +480,16 @@ IMPORTANTE: NÃO mencione "confiança", "métricas" ou números técnicos na res
   private async callGPT(
     prompt: string,
     maxTokens: number,
-    temperature: number
+    temperature: number,
+    model: string = "gpt-3.5-turbo"
   ): Promise<string> {
     const completion = await this.openai.chat.completions.create({
-      model: "gpt-4",
+      model,
       messages: [{ role: "user", content: prompt }],
       max_tokens: maxTokens,
       temperature,
     });
 
     return completion.choices[0]?.message?.content || "";
-  }
-
-  private buildLanguageDetectionPrompt(text: string): string {
-    return `Sua tarefa é identificar o idioma do texto abaixo.
-
-IMPORTANTE: O usuário que enviou este texto NUNCA fala português. Se o texto parecer português, é um erro de transcrição ou detecção. Você deve escolher o idioma mais provável da lista abaixo, excluindo o português.
-
-Texto para analisar:
-"${text}"
-
-Com base no texto, escolha um dos seguintes idiomas:
-- inglês
-- francês
-- espanhol
-- italiano
-- alemão
-- japonês
-- coreano
-- chinês
-- russo
-- árabe
-
-Responda apenas com o nome do idioma em português.`;
-  }
-
-  private buildTextLanguagePrompt(text: string): string {
-    return `Identifique o idioma do seguinte texto. Responda APENAS com uma das seguintes opções exatas:
-- inglês
-- português
-- espanhol
-- francês
-- italiano
-- alemão
-- japonês
-- coreano
-- chinês
-- russo
-- árabe
-
-Texto: "${text}"
-
-Responda apenas uma palavra (o nome do idioma em português):`;
-  }
-
-  private buildEvaluationPrompt(
-    transcription: string,
-    targetLanguage: string,
-    audioContext: string
-  ): string {
-    return `Você é um professor de ${targetLanguage} extremamente rigoroso. Seu objetivo é ajudar um estudante brasileiro a atingir a fluência, corrigindo erros de pronúncia e gramática de forma precisa.
-
-TRANSCRIÇÃO: "${transcription}"
-IDIOMA DETECTADO DO ÁUDIO: ${targetLanguage}
-
-${audioContext}
-
-🎯 AVALIAÇÃO GERAL (PRONÚNCIA E GRAMÁTICA):
-
-PRIMEIRO PASSO: Verifique se o idioma da TRANSCRIÇÃO acima é o mesmo que o IDIOMA DETECTADO DO ÁUDIO (${targetLanguage}). Se a transcrição estiver em um idioma diferente, a transcrição falhou. Nesse caso, ignore o resto das instruções e responda APENAS com o seguinte JSON:
-{
-  "score": 0,
-  "feedback": "Houve um erro na transcrição. O áudio parece ser em ${targetLanguage}, mas foi transcrito em outro idioma. Por favor, tente falar um pouco mais devagar e com mais clareza.",
-  "tips": "Grave em um ambiente sem ruído para ajudar a IA a entender o idioma corretamente."
-}
-
-Se o idioma estiver correto, continue com a avaliação abaixo:
-
-1. ANÁLISE GRAMATICAL:
-   - Verifique se a frase transcrita está gramaticalmente correta.
-   - Erros gramaticais graves DEVEM impactar NEGATIVAMENTE a pontuação final, mesmo que a pronúncia seja boa. O objetivo é a comunicação eficaz e CORRETA.
-
-2. QUALIDADE DA PRONÚNCIA:
-   - A transcrição correta é o requisito mínimo, não garante nota alta.
-   - Avalie clareza, precisão dos fonemas, entonação e ritmo.
-   - Sotaque é aceitável, mas erros de pronúncia que se distanciam muito do padrão devem diminuir a nota.
-
-3. CRITÉRIOS DE PONTUAÇÃO (1 a 10) - SEJA MUITO RIGOROSO:
-   - 10: Perfeito. Gramática impecável e pronúncia nativa.
-   - 8-9: Excelente. Gramática correta e pronúncia muito clara com sotaque leve.
-   - 6-7: Bom. Gramática correta com pequenos deslizes E/OU pronúncia clara com erros notáveis que não atrapalham.
-   - 4-5: Regular. Erros gramaticais E/OU de pronúncia que dificultam a compreensão.
-   - 1-3: Fraco. Erros graves de gramática e/ou pronúncia que impedem a comunicação.
-
-4. NO SEU FEEDBACK:
-   - Se houver erro gramatical, mencione-o PRIMEIRO e mostre a forma correta.
-   - Fale sobre clareza, entonação e ritmo da pronúncia.
-   - Seja específico sobre sons ou palavras que podem melhorar.
-
-Responda no formato JSON SEM DADOS TÉCNICOS:
-{
-  "score": [um número de 1 a 10, baseado nos critérios RIGOROSOS acima],
-  "feedback": "[Primeiro, a correção gramatical (se houver). Depois, a análise da pronúncia.]",
-  "tips": "[Dicas para gramática e/ou pronúncia.]"
-}`;
-  }
-
-  private buildTextEvaluationPrompt(
-    transcription: string,
-    detectedLanguage: string
-  ): string {
-    return `Você é um professor de ${detectedLanguage} brasileiro. Analise a seguinte transcrição de texto:
-
-"${transcription}"
-
-IMPORTANTE: Baseie-se apenas na correção textual, já que não há áudio disponível.
-
-Forneça um feedback no formato JSON:
-{
-  "score": [número de 1 a 10],
-  "feedback": "[análise da correção textual]",
-  "tips": "[2-3 dicas para melhorar]"
-}
-
-Responda APENAS o JSON.`;
   }
 }
